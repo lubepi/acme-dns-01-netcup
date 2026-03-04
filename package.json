@@ -10,7 +10,7 @@
   "scripts": {
     "build": "tsc",
     "prepublishOnly": "npm run build",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "npm run build && node test.js"
   },
   "keywords": [
     "acme",
@@ -26,11 +26,20 @@
   ],
   "author": "lubepi",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lubepi/acme-dns-01-netcup.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lubepi/acme-dns-01-netcup/issues"
+  },
+  "homepage": "https://github.com/lubepi/acme-dns-01-netcup#readme",
   "engines": {
     "node": ">=18.0.0"
   },
   "devDependencies": {
-    "typescript": "^5.7.0",
-    "@types/node": "^20.0.0"
+    "@types/node": "^20.0.0",
+    "acme-dns-01-test": "^3.3.2",
+    "typescript": "^5.7.0"
   }
 }
