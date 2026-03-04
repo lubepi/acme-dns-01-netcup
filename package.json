@@ -1,0 +1,36 @@
+{
+  "name": "acme-dns-01-netcup",
+  "version": "1.1.1",
+  "description": "Netcup DNS for Let's Encrypt / ACME dns-01 challenges with ACME.js and Greenlock.js",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "acme",
+    "acme-dns-01",
+    "dns-01",
+    "letsencrypt",
+    "ssl",
+    "tls",
+    "certificate",
+    "netcup",
+    "greenlock",
+    "greenlock-dns-01"
+  ],
+  "author": "lubepi",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^20.0.0"
+  }
+}
