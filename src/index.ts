@@ -42,8 +42,8 @@ export interface NetcupOptions {
      */
     retries?: number;
     /**
-     * Maximum number of retries for public resolver polling.
-     * Default: 60 (= ~10 min with default waitFor).
+     * Maximum number of retries for public and system resolver polling.
+     * Default: 120 (= ~20 min with default waitFor).
      */
     publicRetries?: number;
     /**
@@ -70,8 +70,31 @@ interface Challenge {
     dnsAuthorization: string;
 }
 
+/**
+ * The acme-dns-01-test harness passes a different "query" format to get()
+ * where dnsHost is at identifier.value instead of being a direct property.
+ */
+interface ChallengeQuery {
+    dnsHost?: string;
+    dnsAuthorization: string;
+    identifier?: { type: string; value: string };
+}
+
 interface ChallengeData {
     challenge: Challenge;
+}
+
+interface QueryData {
+    challenge: ChallengeQuery;
+}
+
+/**
+ * Extract the dnsHost from a challenge or query object.
+ * ACME clients pass { dnsHost: "..." }, but the acme-dns-01-test harness
+ * passes a "query" format where dnsHost is at { identifier: { value: "..." } }.
+ */
+function extractDnsHost(challenge: Challenge | ChallengeQuery): string {
+    return challenge.dnsHost || (challenge as ChallengeQuery).identifier?.value || '';
 }
 
 // ---------------------------------------------------------------------------
@@ -395,7 +418,7 @@ export function create(options: NetcupOptions) {
     const doVerify = options.verifyPropagation ?? true;
     const waitFor = options.waitFor ?? 10_000;
     const retries = options.retries ?? 120;
-    const publicRetries = options.publicRetries ?? 60;
+    const publicRetries = options.publicRetries ?? 120;
 
     if (!customerNumber || !apiKey || !apiPassword) {
         throw new Error('acme-dns-01-netcup: customerNumber, apiKey, and apiPassword are all required');
@@ -405,6 +428,16 @@ export function create(options: NetcupOptions) {
 
     return {
         module: 'acme-dns-01-netcup',
+
+        /**
+         * Internal bookkeeping of removed TXT records.  After remove() deletes
+         * a record via the Netcup API, the public/system DNS resolvers may
+         * still serve a stale cached copy.  We track removed dnsHosts here so
+         * that get() immediately returns null for freshly-deleted records.
+         * set() clears the flag when a new record is created for the same host.
+         * @internal
+         */
+        _removedHosts: new Set<string>(),
 
         /**
          * Propagation delay for acme.js / greenlock.js.
@@ -476,6 +509,9 @@ export function create(options: NetcupOptions) {
             const { dnsHost, dnsAuthorization } = data.challenge;
             log(verbose, `set: dnsHost="${dnsHost}"`);
 
+            // Clear any previous removal flag for this host
+            this._removedHosts.delete(dnsHost);
+
             // Create the TXT record via Netcup API
             let apisessionid: string;
             try {
@@ -523,9 +559,20 @@ export function create(options: NetcupOptions) {
             return null;
         },
 
-        async get(data: ChallengeData): Promise<{ dnsAuthorization: string } | null> {
-            const { dnsHost, dnsAuthorization } = data.challenge;
+        async get(data: QueryData): Promise<{ dnsAuthorization: string } | null> {
+            const dnsHost = extractDnsHost(data.challenge);
+            const { dnsAuthorization } = data.challenge;
             log(verbose, `get: checking dnsHost="${dnsHost}"`);
+            if (!dnsHost) {
+                log(verbose, 'get: no dnsHost found in challenge data');
+                return null;
+            }
+            // If this host was freshly removed, return null immediately
+            // (DNS resolvers may still serve a cached stale copy).
+            if (this._removedHosts.has(dnsHost)) {
+                log(verbose, `get: dnsHost="${dnsHost}" was recently removed, returning null`);
+                return null;
+            }
             try {
                 const results = await publicResolver.resolveTxt(dnsHost);
                 const found = results.flat().includes(dnsAuthorization);
@@ -537,8 +584,8 @@ export function create(options: NetcupOptions) {
             }
         },
 
-        async remove(data: ChallengeData): Promise<null> {
-            const { dnsHost } = data.challenge;
+        async remove(data: ChallengeData | QueryData): Promise<null> {
+            const dnsHost = extractDnsHost(data.challenge);
             log(verbose, `remove: dnsHost="${dnsHost}"`);
 
             const apisessionid = await login(customerNumber, apiKey, apiPassword);
@@ -564,22 +611,26 @@ export function create(options: NetcupOptions) {
 
                 if (toDelete.length === 0) {
                     log(verbose, `remove: no TXT records found for hostname="${hostname}" in zone="${rootDomain}"`);
-                    return null;
-                }
-                if (toDelete.length > 1) {
-                    log(
-                        verbose,
-                        `remove: deleting ${toDelete.length} TXT records for hostname="${hostname}" (including stale records from previous runs)`,
-                    );
+                } else {
+                    if (toDelete.length > 1) {
+                        log(
+                            verbose,
+                            `remove: deleting ${toDelete.length} TXT records for hostname="${hostname}" (including stale records from previous runs)`,
+                        );
+                    }
+
+                    await apiCall('updateDnsRecords', {
+                        customernumber: String(customerNumber),
+                        apikey: apiKey,
+                        apisessionid,
+                        domainname: rootDomain,
+                        dnsrecordset: { dnsrecords: toDelete },
+                    });
                 }
 
-                await apiCall('updateDnsRecords', {
-                    customernumber: String(customerNumber),
-                    apikey: apiKey,
-                    apisessionid,
-                    domainname: rootDomain,
-                    dnsrecordset: { dnsrecords: toDelete },
-                });
+                // Mark host as removed so get() returns null immediately
+                // (DNS resolvers may still serve the stale cached record).
+                this._removedHosts.add(dnsHost);
             } finally {
                 await logout(customerNumber, apiKey, apisessionid);
             }
