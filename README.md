@@ -3,6 +3,8 @@ acme-dns-01-netcup
 
 [Netcup](https://www.netcup.de/) DNS + Let's Encrypt. This module handles ACME dns-01 challenges, compatible with [ACME.js](https://www.npmjs.com/package/acme) and [Greenlock.js](https://www.npmjs.com/package/greenlock).
 
+It passes [acme-dns-01-test](https://github.com/therootcompany/acme-dns-01-test).
+
 ## Features
 
 - Full [Netcup CCP DNS API](https://www.netcup-wiki.de/wiki/CCP_API) integration
