@@ -59,6 +59,7 @@ interface DnsRecord {
     hostname: string;
     type: string;
     destination: string;
+    ttl?: number;
     deleterecord?: boolean;
     [key: string]: unknown;
 }
@@ -307,6 +308,7 @@ async function verifyPropagationFn(
     waitFor: number,
     retries: number,
     publicRetries: number,
+    systemResolverCache: Set<string>,
 ): Promise<void> {
     const { dnsHost, dnsAuthorization } = challenge;
     const zone = dnsHost.split('.').slice(-2).join('.');
@@ -366,27 +368,47 @@ async function verifyPropagationFn(
     // OS system resolver (/etc/resolv.conf).  By verifying propagation here
     // we prevent the ACME client's own DNS check from failing with ENOTFOUND
     // after set() returns.
-    log(verbose, `verifying on system resolver for ${dnsHost}...`);
-
-    const systemOk = await pollTxtRecord(
-        systemResolver,
-        dnsHost,
-        dnsAuthorization,
-        publicRetries,
-        waitFor,
-        'system resolver',
-        verbose,
-    );
-
-    if (systemOk) {
-        log(verbose, `TXT record verified on system resolver for ${dnsHost}`);
-    } else {
-        // Not fatal — authoritative NS has it, LE validators don't use our
-        // system resolver.  But the ACME library's own pre-flight check may
-        // still fail.  Log a warning so users can diagnose the issue.
-        console.warn(
-            `[acme-dns-01-netcup] system resolver timeout for ${dnsHost} — the ACME library's own DNS pre-flight check may fail`,
+    //
+    // Skip if this dnsHost was already verified on the system resolver in a
+    // previous set() call.  This happens with wildcard certificates:
+    // both foo.example.com and *.foo.example.com share the same dnsHost
+    // (_acme-challenge.foo.example.com).  The system resolver will have
+    // cached the first TXT record and won't see the second one until the
+    // cache entry expires (potentially hours with aggressive caching).
+    // Since auth NS + public resolvers already confirmed the record, the
+    // system resolver check is not essential.
+    if (systemResolverCache.has(dnsHost)) {
+        log(
+            verbose,
+            `skipping system resolver for ${dnsHost} — already verified in a previous set() call (stale cache expected)`,
         );
+    } else {
+        log(verbose, `verifying on system resolver for ${dnsHost}...`);
+
+        const systemOk = await pollTxtRecord(
+            systemResolver,
+            dnsHost,
+            dnsAuthorization,
+            publicRetries,
+            waitFor,
+            'system resolver',
+            verbose,
+        );
+
+        if (systemOk) {
+            log(verbose, `TXT record verified on system resolver for ${dnsHost}`);
+        } else {
+            // Not fatal — authoritative NS has it, LE validators don't use our
+            // system resolver.  But the ACME library's own pre-flight check may
+            // still fail.  Log a warning so users can diagnose the issue.
+            console.warn(
+                `[acme-dns-01-netcup] system resolver timeout for ${dnsHost} — the ACME library's own DNS pre-flight check may fail`,
+            );
+        }
+
+        // Mark as verified (or attempted) so subsequent calls for the same
+        // dnsHost skip the system resolver entirely.
+        systemResolverCache.add(dnsHost);
     }
 }
 
@@ -426,6 +448,13 @@ export function create(options: NetcupOptions) {
 
     log(verbose, `create() called for customerNumber="${customerNumber}"`);
 
+    // Tracks dnsHosts that have been verified (or attempted) on the system
+    // resolver.  When the same dnsHost appears in a subsequent set() call
+    // (e.g. wildcard certificate sharing the same _acme-challenge hostname),
+    // the system resolver poll is skipped because its cache will still hold
+    // the stale first TXT value.
+    const systemResolverCache = new Set<string>();
+
     return {
         module: 'acme-dns-01-netcup',
 
@@ -438,6 +467,17 @@ export function create(options: NetcupOptions) {
          * @internal
          */
         _removedHosts: new Set<string>(),
+
+        /**
+         * Internal bookkeeping of TXT records created via set().
+         * Maps dnsHost → Set of dnsAuthorization values.
+         * get() uses this as primary source of truth instead of DNS lookups,
+         * because DNS caches (especially for shared dnsHosts in wildcard
+         * scenarios) may not yet reflect the latest records.
+         * remove() clears entries for the given dnsHost.
+         * @internal
+         */
+        _setRecords: new Map<string, Set<string>>(),
 
         /**
          * Propagation delay for acme.js / greenlock.js.
@@ -512,6 +552,13 @@ export function create(options: NetcupOptions) {
             // Clear any previous removal flag for this host
             this._removedHosts.delete(dnsHost);
 
+            // Track this record so get() can find it immediately
+            // (DNS caches may not yet reflect the new record).
+            if (!this._setRecords.has(dnsHost)) {
+                this._setRecords.set(dnsHost, new Set());
+            }
+            this._setRecords.get(dnsHost)!.add(dnsAuthorization);
+
             // Create the TXT record via Netcup API
             let apisessionid: string;
             try {
@@ -536,6 +583,13 @@ export function create(options: NetcupOptions) {
                                 type: 'TXT',
                                 destination: dnsAuthorization,
                                 deleterecord: false,
+                                // Short TTL so ACME challenge records propagate quickly
+                                // and stale cached values expire sooner.
+                                // 300 s is Netcup's minimum; at this TTL the system
+                                // resolver will re-query within 5 min, which is essential
+                                // when two TXT records share the same hostname
+                                // (e.g. foo.example.com + *.foo.example.com).
+                                ttl: 300,
                             } satisfies DnsRecord,
                         ],
                     },
@@ -553,7 +607,7 @@ export function create(options: NetcupOptions) {
 
             // Verify propagation if enabled
             if (doVerify) {
-                await verifyPropagationFn(data.challenge, verbose, waitFor, retries, publicRetries);
+                await verifyPropagationFn(data.challenge, verbose, waitFor, retries, publicRetries, systemResolverCache);
             }
 
             return null;
@@ -572,6 +626,14 @@ export function create(options: NetcupOptions) {
             if (this._removedHosts.has(dnsHost)) {
                 log(verbose, `get: dnsHost="${dnsHost}" was recently removed, returning null`);
                 return null;
+            }
+            // Check our internal bookkeeping first — this is authoritative
+            // and avoids DNS cache inconsistencies (e.g. shared dnsHosts in
+            // wildcard scenarios where the resolver still caches old data).
+            const knownValues = this._setRecords.get(dnsHost);
+            if (knownValues?.has(dnsAuthorization)) {
+                log(verbose, `get: found=true (from internal bookkeeping)`);
+                return { dnsAuthorization };
             }
             try {
                 const results = await publicResolver.resolveTxt(dnsHost);
@@ -631,6 +693,9 @@ export function create(options: NetcupOptions) {
                 // Mark host as removed so get() returns null immediately
                 // (DNS resolvers may still serve the stale cached record).
                 this._removedHosts.add(dnsHost);
+
+                // Clear internal bookkeeping so get() won't return stale data.
+                this._setRecords.delete(dnsHost);
             } finally {
                 await logout(customerNumber, apiKey, apisessionid);
             }
