@@ -309,9 +309,11 @@ async function verifyPropagationFn(
     retries: number,
     publicRetries: number,
     systemResolverCache: Set<string>,
+    zoneOverride?: string,
 ): Promise<void> {
     const { dnsHost, dnsAuthorization } = challenge;
-    const zone = dnsHost.split('.').slice(-2).join('.');
+    // Fall back to last-two-labels if no zone provided, but we should always have one from set()
+    const zone = zoneOverride || dnsHost.split('.').slice(-2).join('.');
 
     // Wait one tick before first query to avoid cache pollution
     await delay(waitFor);
@@ -561,6 +563,7 @@ export function create(options: NetcupOptions) {
 
             // Create the TXT record via Netcup API
             let apisessionid: string;
+            let rootDomain: string | undefined;
             try {
                 apisessionid = await login(customerNumber, apiKey, apiPassword);
             } catch (err) {
@@ -568,7 +571,9 @@ export function create(options: NetcupOptions) {
                 throw err;
             }
             try {
-                const { rootDomain, hostname } = await findZone(dnsHost, customerNumber, apiKey, apisessionid, verbose);
+                const zoneInfo = await findZone(dnsHost, customerNumber, apiKey, apisessionid, verbose);
+                rootDomain = zoneInfo.rootDomain;
+                const { hostname } = zoneInfo;
                 log(verbose, `set: creating TXT hostname="${hostname}" in zone="${rootDomain}"`);
 
                 const setResult = await apiCall('updateDnsRecords', {
@@ -607,7 +612,15 @@ export function create(options: NetcupOptions) {
 
             // Verify propagation if enabled
             if (doVerify) {
-                await verifyPropagationFn(data.challenge, verbose, waitFor, retries, publicRetries, systemResolverCache);
+                await verifyPropagationFn(
+                    data.challenge,
+                    verbose,
+                    waitFor,
+                    retries,
+                    publicRetries,
+                    systemResolverCache,
+                    rootDomain,
+                );
             }
 
             return null;
