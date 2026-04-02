@@ -309,11 +309,9 @@ async function verifyPropagationFn(
     retries: number,
     publicRetries: number,
     systemResolverCache: Set<string>,
-    zoneOverride?: string,
+    zone: string,
 ): Promise<void> {
     const { dnsHost, dnsAuthorization } = challenge;
-    // Fall back to last-two-labels if no zone provided, but we should always have one from set()
-    const zone = zoneOverride || dnsHost.split('.').slice(-2).join('.');
 
     // Wait one tick before first query to avoid cache pollution
     await delay(waitFor);
