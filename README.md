@@ -8,7 +8,7 @@ It passes [acme-dns-01-test](https://github.com/therootcompany/acme-dns-01-test)
 ## Features
 
 - Full [Netcup CCP DNS API](https://www.netcup-wiki.de/wiki/CCP_API) integration
-- **Built-in propagation verification** — `set()` polls authoritative nameservers and public resolvers (1.1.1.1 / 8.8.8.8) before returning
+- **Built-in propagation verification** — `set()` polls authoritative nameservers before returning
 - Automatic zone detection (walks from most-specific to least-specific)
 - Cleans up stale TXT records from previous runs on `remove()`
 - Supports wildcard certificates (dns-01 is required for `*.example.com`)
@@ -108,15 +108,14 @@ await greenlock.add({
 | `verifyPropagation` | `boolean` | `true` | Wait for DNS propagation in `set()` before returning |
 | `verbose` | `boolean` | `false` | Log debug information to console |
 | `waitFor` | `number` | `10000` | Interval (ms) between DNS polling attempts |
-| `retries` | `number` | `120` | Max retries for authoritative NS polling (~20 min) |
-| `publicRetries` | `number` | `60` | Max retries for public resolver polling (~10 min) |
+| `retries` | `number` | `120` | Max retries for polling (~20 min) |
 | `propagationDelay` | `number` | `120000` | Delay (ms) for acme.js (only when `verifyPropagation` is false) |
 
 ## Why does `set()` take so long?
 
 Netcup uses a serialised DNS zone update queue. A single update typically takes 5–10 minutes to propagate. If a previous `remove()` and new `set()` happen close together, the queue can take 10–20 minutes.
 
-When `verifyPropagation` is enabled (default), `set()` polls the authoritative nameservers every 10 seconds (up to 20 minutes), then verifies on public resolvers (1.1.1.1 / 8.8.8.8) for up to 10 additional minutes. This ensures Let's Encrypt validators see the record on the first attempt.
+When `verifyPropagation` is enabled (default), `set()` polls the authoritative nameservers every 10 seconds (up to 20 minutes) until the record is visible. The system resolver is only used as a fallback if authoritative nameservers cannot be determined.
 
 If you disable `verifyPropagation`, you must set a sufficiently large `propagationDelay` to account for Netcup's queue (at least 120 seconds, but more may be needed).
 

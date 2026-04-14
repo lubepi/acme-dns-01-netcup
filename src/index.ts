@@ -2,10 +2,6 @@
 
 import { Resolver } from 'node:dns/promises';
 
-// Public DNS resolvers for propagation verification.
-const publicResolver = new Resolver();
-publicResolver.setServers(['1.1.1.1', '8.8.8.8']);
-
 // System resolver — uses whatever /etc/resolv.conf (or OS equivalent) provides.
 // ACME clients (acme.js, greenlock.js) use require('dns').resolveTxt internally
 // for their own challenge pre-flight checks, which hits this same system resolver.
@@ -41,11 +37,6 @@ export interface NetcupOptions {
      * Default: 120 (= ~20 min with default waitFor).
      */
     retries?: number;
-    /**
-     * Maximum number of retries for public and system resolver polling.
-     * Default: 120 (= ~20 min with default waitFor).
-     */
-    publicRetries?: number;
     /**
      * Propagation delay (ms) passed to acme.js.
      * Only used when verifyPropagation is false.
@@ -221,31 +212,32 @@ async function findZone(
 
 /**
  * Build a Resolver pointing at the zone's authoritative nameservers.
- * Falls back to public resolvers if NS lookup fails.
+ * Uses the system resolver to find NS records and resolve their IP addresses.
  */
-async function getAuthoritativeResolver(zone: string, verbose: boolean): Promise<Resolver> {
+async function getAuthoritativeResolver(zone: string, verbose: boolean): Promise<Resolver | null> {
     try {
-        const nsNames = await publicResolver.resolveNs(zone);
+        const nsNames = await systemResolver.resolveNs(zone);
         const nsIps: string[] = [];
+
         for (const ns of nsNames.slice(0, 3)) {
             try {
-                const addrs = await publicResolver.resolve4(ns);
+                const addrs = await systemResolver.resolve4(ns);
                 nsIps.push(...addrs.map((ip: string) => `${ip}:53`));
             } catch {
                 /* skip */
             }
         }
+
         if (nsIps.length > 0) {
             const resolver = new Resolver();
             resolver.setServers(nsIps);
             log(verbose, `using authoritative NS for ${zone}: ${nsIps.join(', ')}`);
             return resolver;
         }
-        log(verbose, `NS lookup empty for ${zone}, falling back to public resolvers`);
     } catch {
-        log(verbose, `NS lookup failed for ${zone}, falling back to public resolvers`);
+        log(verbose, `failed to determine authoritative NS for ${zone} via system resolver`);
     }
-    return publicResolver;
+    return null;
 }
 
 function delay(ms: number): Promise<void> {
@@ -290,125 +282,62 @@ async function pollTxtRecord(
     return false;
 }
 
-/**
- * Verify that the TXT record is visible on authoritative, public, and system resolvers.
- *
- * Steps:
- *  1. Poll the zone's authoritative nameservers (required — throws on failure).
- *  2. Poll public resolvers (1.1.1.1/8.8.8.8)  — non-fatal timeout.
- *  3. Poll the OS system resolver (/etc/resolv.conf) — non-fatal timeout.
- *
- * Step 3 ensures that ACME clients (acme.js, greenlock.js) whose own DNS
- * pre-flight check uses require('dns').resolveTxt (= system resolver) will
- * also see the record by the time set() returns.
- */
 async function verifyPropagationFn(
     challenge: Challenge,
     verbose: boolean,
     waitFor: number,
     retries: number,
-    publicRetries: number,
-    systemResolverCache: Set<string>,
     zone: string,
 ): Promise<void> {
     const { dnsHost, dnsAuthorization } = challenge;
 
-    // Wait one tick before first query to avoid cache pollution
+    // Wait one tick before first query to avoid cache pollution (some local
+    // resolvers cache NXDOMAIN results aggressively).
     await delay(waitFor);
 
-    // Step 1: Poll authoritative NS
+    // Step 1: Poll authoritative NS (Primary)
     const authResolver = await getAuthoritativeResolver(zone, verbose);
-    log(
-        verbose,
-        `polling authoritative NS for ${dnsHost} (every ${waitFor / 1000}s, max ${retries} attempts)...`,
-    );
-
-    const authOk = await pollTxtRecord(
-        authResolver,
-        dnsHost,
-        dnsAuthorization,
-        retries,
-        waitFor,
-        'authoritative NS',
-        verbose,
-    );
-
-    if (!authOk) {
-        throw new Error(
-            `[acme-dns-01-netcup] TXT record not visible on authoritative NS for ${dnsHost} after ${retries} attempts`,
-        );
-    }
-
-    // Step 2: Poll public resolvers (LE validators use recursive resolvers that
-    // may have cached a negative NXDOMAIN response from earlier)
-    log(verbose, `${dnsHost} visible on authoritative NS — verifying on public resolvers...`);
-
-    const publicOk = await pollTxtRecord(
-        publicResolver,
-        dnsHost,
-        dnsAuthorization,
-        publicRetries,
-        waitFor,
-        'public resolver',
-        verbose,
-    );
-
-    if (publicOk) {
-        log(verbose, `TXT record verified on public resolvers for ${dnsHost}`);
-    } else {
-        // Not fatal — authoritative NS has it, LE might still succeed.
-        console.warn(
-            `[acme-dns-01-netcup] public resolver timeout for ${dnsHost} — proceeding anyway (authoritative NS has the record)`,
-        );
-    }
-
-    // Step 3: Poll system resolver.
-    // ACME clients (acme.js, greenlock.js) use require('dns').resolveTxt
-    // internally for their own challenge pre-flight checks, which hits the
-    // OS system resolver (/etc/resolv.conf).  By verifying propagation here
-    // we prevent the ACME client's own DNS check from failing with ENOTFOUND
-    // after set() returns.
-    //
-    // Skip if this dnsHost was already verified on the system resolver in a
-    // previous set() call.  This happens with wildcard certificates:
-    // both foo.example.com and *.foo.example.com share the same dnsHost
-    // (_acme-challenge.foo.example.com).  The system resolver will have
-    // cached the first TXT record and won't see the second one until the
-    // cache entry expires (potentially hours with aggressive caching).
-    // Since auth NS + public resolvers already confirmed the record, the
-    // system resolver check is not essential.
-    if (systemResolverCache.has(dnsHost)) {
+    
+    if (authResolver) {
         log(
             verbose,
-            `skipping system resolver for ${dnsHost} — already verified in a previous set() call (stale cache expected)`,
+            `polling authoritative NS for ${dnsHost} (every ${waitFor / 1000}s, max ${retries} attempts)...`,
         );
-    } else {
-        log(verbose, `verifying on system resolver for ${dnsHost}...`);
 
+        const authOk = await pollTxtRecord(
+            authResolver,
+            dnsHost,
+            dnsAuthorization,
+            retries,
+            waitFor,
+            'authoritative NS',
+            verbose,
+        );
+
+        if (authOk) {
+            log(verbose, `${dnsHost} visible on authoritative NS`);
+        } else {
+            throw new Error(
+                `[acme-dns-01-netcup] TXT record not visible on authoritative NS for ${dnsHost} after ${retries} attempts. Skipping system resolver fallback as authoritative NS are reachable.`,
+            );
+        }
+    } else {
+        log(verbose, `could not determine or reach authoritative NS for ${zone} — falling back to system resolver polling...`);
         const systemOk = await pollTxtRecord(
             systemResolver,
             dnsHost,
             dnsAuthorization,
-            publicRetries,
+            retries,
             waitFor,
-            'system resolver',
+            'system resolver (fallback)',
             verbose,
         );
 
-        if (systemOk) {
-            log(verbose, `TXT record verified on system resolver for ${dnsHost}`);
-        } else {
-            // Not fatal — authoritative NS has it, LE validators don't use our
-            // system resolver.  But the ACME library's own pre-flight check may
-            // still fail.  Log a warning so users can diagnose the issue.
-            console.warn(
-                `[acme-dns-01-netcup] system resolver timeout for ${dnsHost} — the ACME library's own DNS pre-flight check may fail`,
+        if (!systemOk) {
+            throw new Error(
+                `[acme-dns-01-netcup] TXT record not visible on system resolver for ${dnsHost} after ${retries} attempts`,
             );
         }
-
-        // Mark as verified (or attempted) so subsequent calls for the same
-        // dnsHost skip the system resolver entirely.
-        systemResolverCache.add(dnsHost);
     }
 }
 
@@ -422,12 +351,7 @@ async function verifyPropagationFn(
  * Compatible with ACME.js, Greenlock.js, and any ACME client that uses the
  * standard dns-01 challenge plugin interface (init, zones, set, get, remove).
  *
- * When `verifyPropagation` is true (default), `set()` blocks until the TXT
- * record is visible on authoritative nameservers, public resolvers
- * (1.1.1.1/8.8.8.8), and the OS system resolver.  This ensures compatibility
- * with ACME clients that run their own DNS pre-flight checks using the system
- * resolver (acme.js, greenlock.js).  Strongly recommended for Netcup because
- * their DNS zone update queue can take 5–20 minutes.
+ * When `verifyPropagation` is enabled (default), `set()` polls the authoritative nameservers every 10 seconds (up to 20 minutes) until the record is visible. The system resolver is only used as a fallback if authoritative nameservers cannot be determined.
  *
  * Required options:
  *   - customerNumber: Netcup customer number (Kundennummer)
@@ -440,21 +364,12 @@ export function create(options: NetcupOptions) {
     const doVerify = options.verifyPropagation ?? true;
     const waitFor = options.waitFor ?? 10_000;
     const retries = options.retries ?? 120;
-    const publicRetries = options.publicRetries ?? 120;
 
     if (!customerNumber || !apiKey || !apiPassword) {
         throw new Error('acme-dns-01-netcup: customerNumber, apiKey, and apiPassword are all required');
     }
 
     log(verbose, `create() called for customerNumber="${customerNumber}"`);
-
-    // Tracks dnsHosts that have been verified (or attempted) on the system
-    // resolver.  When the same dnsHost appears in a subsequent set() call
-    // (e.g. wildcard certificate sharing the same _acme-challenge hostname),
-    // the system resolver poll is skipped because its cache will still hold
-    // the stale first TXT value.
-    const systemResolverCache = new Set<string>();
-
     return {
         module: 'acme-dns-01-netcup',
 
@@ -615,8 +530,6 @@ export function create(options: NetcupOptions) {
                     verbose,
                     waitFor,
                     retries,
-                    publicRetries,
-                    systemResolverCache,
                     rootDomain,
                 );
             }
@@ -647,7 +560,7 @@ export function create(options: NetcupOptions) {
                 return { dnsAuthorization };
             }
             try {
-                const results = await publicResolver.resolveTxt(dnsHost);
+                const results = await systemResolver.resolveTxt(dnsHost);
                 const found = results.flat().includes(dnsAuthorization);
                 log(verbose, `get: found=${found}`);
                 return found ? { dnsAuthorization } : null;
